@@ -1,31 +1,32 @@
 ﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Пакетная конвертация PDF -> PDF/A-2b (grayscale, 300 dpi) через Ghostscript.
+Пакетная конвертация PDF -> PDF/A-2b через Ghostscript.
 
-Функциональность:
-  * копирует ICC-профиль srgb.icc в локальную папку _icc (без пробелов в пути);
-  * генерирует канонический PDFA_def.ps (OutputIntent через /type /stream);
-  * для файлов с префиксами из FILTERTEXT_PREFIXES применяет -dFILTERTEXT;
-  * постобработка через pikepdf:
-      - вставка XMP PDF/A-2b identification;
-      - strip /CIDSet из FontDescriptor;
-      - FIX TrueType post/maxp (numberOfGlyphs == numGlyphs);
-      - пересохранение (EOL у stream/endstream, spacing у obj/endobj).
-
-Опционально в GS включаются -dEmbedAllFonts=true и -dSubsetFonts=true,
-что заставляет Ghostscript пересобрать встроенные шрифты.
+Возможности:
+  * ASCII-песочница (C:\\Temp\\pdfa_work_*);
+  * -dNOSAFER + --permit-file-read=* -- снимают sandbox;
+  * даунсэмплинг всего, что > 300 dpi;
+  * авто-обесцвечивание content streams (rg/RG/k/K -> g/G);
+  * исключения: для файлов из KEEP_COLOR_PREFIXES
+      - Ghostscript запускается с -sColorConversionStrategy=LeaveColorUnchanged
+        (GS НЕ трогает цвета),
+      - pikepdf-шаг обесцвечивания пропускается;
+  * постобработка pikepdf: XMP PDF/A-2b, strip /CIDSet,
+    fix TrueType post/maxp, пересохранение.
 """
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 # ============================================================
-#  Настройки -- правьте только этот блок
+#  Настройки
 # ============================================================
 GS        = Path(r"C:\Program Files\gs\gs10.08.0\bin\gswin64c.exe")
 SRC_ICC   = Path(r"C:\Program Files\gs\gs10.08.0\iccprofiles\srgb.icc")
@@ -35,20 +36,37 @@ REPORT    = Path("otchet.txt")
 WORK_DIR     = Path(".")
 ICC_LOCAL_D  = WORK_DIR / "_icc"
 ICC_LOCAL    = ICC_LOCAL_D / "srgb.icc"
-PDFA_DEF     = WORK_DIR / "PDFA_def.ps"
 SUFFIX_SKIP  = "_pdfa"
 
-# --- Компромиссный режим для .notdef ---
-FILTERTEXT_PREFIXES = ("TextPart_",)
-FILTERTEXT_DPI      = 300
+ASCII_TMP_CANDIDATES = [
+    r"C:\Temp",
+    r"C:\Windows\Temp",
+    r"C:\ProgramData\Temp",
+]
+
+# --- Растеризация текста (не применяется) ---
+FILTERTEXT_PREFIXES: tuple[str, ...] = ()
+FILTERTEXT_DPI = 300
 
 # --- Постобработка pikepdf ---
-STRIP_CIDSET       = True   # удалять /CIDSet из FontDescriptor
-FIX_TRUETYPE_POST  = True   # править numberOfGlyphs в post-таблице
-RESUBSET_FONTS     = True   # просить Ghostscript пересобрать шрифты
+STRIP_CIDSET       = True
+FIX_TRUETYPE_POST  = True
+RESUBSET_FONTS     = True
+
+# --- Даунсэмплинг ---
+DOWNSAMPLE_THRESHOLD = 1.0
+
+# --- Обесцвечивание ---
+# Файлы, которые обесцвечивать НЕ надо.
+# Для них:
+#   * Ghostscript запускается с LeaveColorUnchanged
+#   * pikepdf-обесцвечивание пропускается
+KEEP_COLOR_PREFIXES: tuple[str, ...] = (
+    "SchemeDisposition",
+)
 
 # ============================================================
-#  Опциональный импорт pikepdf
+#  Импорт pikepdf
 # ============================================================
 try:
     import pikepdf
@@ -59,7 +77,7 @@ except ImportError:
 
 
 # ============================================================
-#  Канонический шаблон PDFA_def.ps (Artifex)
+#  Шаблон PDFA_def.ps
 # ============================================================
 PDFA_DEF_TEMPLATE = r"""%!
 % PDFA_def.ps -- generated automatically by compress_to_pdfa.py
@@ -92,7 +110,7 @@ PDFA_DEF_TEMPLATE = r"""%!
 
 
 # ============================================================
-#  XMP PDF/A-2b identification
+#  XMP PDF/A-2b
 # ============================================================
 XMP_PDFA_ID = """<?xpacket begin="\ufeff" id="W5M0MpCehiHzreSzNTczkc9d"?>
 <x:xmpmeta xmlns:x="adobe:ns:meta/">
@@ -109,9 +127,36 @@ XMP_PDFA_ID = """<?xpacket begin="\ufeff" id="W5M0MpCehiHzreSzNTczkc9d"?>
 
 
 # ============================================================
-#  Подготовка ICC и PDFA_def.ps
+#  Утилиты
 # ============================================================
-def prepare_icc_and_pdfa_def() -> None:
+def _is_strict_ascii(p: str) -> bool:
+    try:
+        p.encode("ascii")
+        return True
+    except UnicodeEncodeError:
+        return False
+
+
+def get_ascii_tempdir() -> Path:
+    for cand_str in ASCII_TMP_CANDIDATES:
+        cand = Path(cand_str)
+        try:
+            if not _is_strict_ascii(cand_str):
+                continue
+            cand.mkdir(parents=True, exist_ok=True)
+            resolved = cand.resolve()
+            if not _is_strict_ascii(str(resolved)):
+                continue
+            probe = resolved / f".pdfa_probe_{os.getpid()}"
+            probe.write_bytes(b"x")
+            probe.unlink()
+            return resolved
+        except Exception:
+            continue
+    sys.exit("[FATAL] Нет ASCII-совместимой временной папки. Создайте C:\\Temp.")
+
+
+def prepare_local_icc() -> None:
     ICC_LOCAL_D.mkdir(exist_ok=True)
     if (not ICC_LOCAL.exists()) or (ICC_LOCAL.stat().st_size != SRC_ICC.stat().st_size):
         shutil.copyfile(SRC_ICC, ICC_LOCAL)
@@ -119,137 +164,273 @@ def prepare_icc_and_pdfa_def() -> None:
     else:
         print(f"[OK] Локальный ICC уже на месте: {ICC_LOCAL}")
 
-    icc_ps_path = ICC_LOCAL.resolve().as_posix()
-    content = PDFA_DEF_TEMPLATE.replace("__ICC_PATH__", icc_ps_path)
-
-    if PDFA_DEF.exists():
-        old = PDFA_DEF.read_text(encoding="ascii", errors="replace")
-        if (f"/ICCProfile ({icc_ps_path})" in old
-                and "/type /stream /OBJ pdfmark" in old
-                and "/DOCINFO" not in old):
-            print(f"[OK] Использую существующий {PDFA_DEF}")
-            return
-        PDFA_DEF.unlink()
-
-    PDFA_DEF.write_text(content, encoding="ascii")
-    print(f"[OK] Создан {PDFA_DEF} с ICC = {icc_ps_path}")
-
 
 # ============================================================
-#  Проверки перед запуском
+#  Проверки
 # ============================================================
-def preflight() -> None:
+def preflight() -> Path:
     if not GS.is_file():
         sys.exit(f"[FATAL] Ghostscript не найден: {GS}")
     if not SRC_ICC.is_file():
-        icc_dir = SRC_ICC.parent
-        available = sorted(p.name for p in icc_dir.glob("*.icc")) if icc_dir.is_dir() else []
-        sys.exit(
-            f"[FATAL] Исходный ICC-профиль не найден: {SRC_ICC}\n"
-            f"        Содержимое {icc_dir}: {available}"
-        )
-    prepare_icc_and_pdfa_def()
+        sys.exit(f"[FATAL] ICC не найден: {SRC_ICC}")
+    prepare_local_icc()
+    ascii_tmp = get_ascii_tempdir()
+    print(f"[OK] Рабочая ASCII-папка для GS: {ascii_tmp}")
     if not PDFIMAGES.exists():
-        print(f"[WARN] pdfimages не найден: {PDFIMAGES} -- отчёт без списка изображений")
+        print(f"[WARN] pdfimages не найден: {PDFIMAGES}")
     if not HAVE_PIKEPDF:
-        print("[WARN] pikepdf не установлен -- постобработка отключена.")
-        print("       Установите:  pip install pikepdf")
+        print("[WARN] pikepdf не установлен.")
     else:
-        print("[OK] pikepdf найден -- постобработка включена.")
-    print(f"[i] Файлы с префиксами {FILTERTEXT_PREFIXES} обрабатываются с -dFILTERTEXT.")
+        print("[OK] pikepdf найден.")
+    print("[i] FILTERTEXT не применяется.")
+    print(f"[i] Файлы, где цвет СОХРАНЯЕТСЯ: {KEEP_COLOR_PREFIXES}")
+    return ascii_tmp
 
 
 def needs_filtertext(name: str) -> bool:
     return any(name.startswith(p) for p in FILTERTEXT_PREFIXES)
 
 
+def keep_color(name: str) -> bool:
+    return any(name.startswith(p) for p in KEEP_COLOR_PREFIXES)
+
+
 # ============================================================
-#  Конвертация через Ghostscript
+#  Ghostscript
 # ============================================================
-def gs_convert(src: Path, dst: Path, filtertext: bool) -> tuple[bool, str]:
-    icc_dir_abs  = ICC_LOCAL_D.resolve().as_posix()
-    icc_file_abs = ICC_LOCAL.resolve().as_posix()
-    pdfadef_abs  = PDFA_DEF.resolve().as_posix()
-    src_abs      = src.resolve().as_posix()
-    dst_abs      = dst.resolve().as_posix()
+def gs_convert(src: Path, dst: Path, ascii_tmp: Path, report_fh) -> tuple[bool, str]:
+    work_name = f"pdfa_work_{os.getpid()}_{int(time.time() * 1000) % 10**9}"
+    work_dir = ascii_tmp / work_name
 
-    cmd = [
-        str(GS),
-        "-dNOSAFER",
-        f"--permit-file-read={icc_file_abs}",
-        f"--permit-file-read={icc_dir_abs}/",
-        f"--permit-file-read={pdfadef_abs}",
-        "-dPDFA=2",
-        "-dBATCH", "-dNOPAUSE", "-dNOOUTERSAVE",
-        "-sColorConversionStrategy=Gray",
-        "-sProcessColorModel=DeviceGray",
-        f"-sOutputICCProfile={icc_file_abs}",
-        "-dOverrideICC",
-        "-dPDFACompatibilityPolicy=1",
-        "-dPreserveAnnots=false",
-    ]
+    if not _is_strict_ascii(str(work_dir)):
+        return (False, f"work_dir is not ASCII: {work_dir!r}")
 
-    if RESUBSET_FONTS:
-        cmd += [
-            "-dEmbedAllFonts=true",
-            "-dSubsetFonts=true",
-            "-dCompressFonts=true",
-            "-dCompatibilityLevel=1.7",
-        ]
-
-    if filtertext:
-        cmd += ["-dFILTERTEXT", f"-r{FILTERTEXT_DPI}"]
-
-    cmd += [
-        "-dDownsampleGrayImages=true",
-        "-dGrayImageResolution=300",
-        "-dGrayImageDownsampleType=/Bicubic",
-        "-dDownsampleMonoImages=true",
-        "-dMonoImageResolution=300",
-        "-dMonoImageDownsampleType=/Bicubic",
-        "-sDEVICE=pdfwrite",
-        f"-sOutputFile={dst_abs}",
-        pdfadef_abs,
-        src_abs,
-    ]
+    filtertext = needs_filtertext(src.name)
+    keep_c     = keep_color(src.name)
 
     try:
-        res = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="cp866",
-            errors="replace",
-        )
+        work_dir.mkdir(parents=True, exist_ok=False)
+
+        tmp_src = work_dir / "input.pdf"
+        shutil.copyfile(src, tmp_src)
+
+        tmp_icc = work_dir / "srgb.icc"
+        shutil.copyfile(ICC_LOCAL, tmp_icc)
+
+        if not tmp_icc.is_file() or tmp_icc.stat().st_size == 0:
+            return (False, f"ICC copy is empty: {tmp_icc}")
+
+        icc_ps_path = tmp_icc.as_posix()
+
+        tmp_def = work_dir / "PDFA_def.ps"
+        def_content = PDFA_DEF_TEMPLATE.replace("__ICC_PATH__", icc_ps_path)
+        tmp_def.write_bytes(def_content.encode("ascii"))
+
+        tmp_out = work_dir / "output.pdf"
+        out_ps_path = tmp_out.as_posix()
+
+        cmd = [
+            str(GS),
+            "-dNOSAFER",
+            "--permit-file-read=*",
+            "-dPDFA=2",
+            "-dBATCH", "-dNOPAUSE", "-dNOOUTERSAVE",
+        ]
+
+        # --- Цветовая стратегия ---
+        if keep_c:
+            # Не трогаем цвет -- оставляем RGB как есть
+            cmd += ["-sColorConversionStrategy=LeaveColorUnchanged"]
+            report_fh.write(f"[color-strategy] {src.name}: LeaveColorUnchanged\n")
+        else:
+            # Всё в оттенки серого
+            cmd += [
+                "-sColorConversionStrategy=Gray",
+                "-sProcessColorModel=DeviceGray",
+            ]
+            report_fh.write(f"[color-strategy] {src.name}: Gray\n")
+
+        cmd += [
+            f"-sOutputICCProfile={icc_ps_path}",
+            "-dOverrideICC",
+            "-dPDFACompatibilityPolicy=1",
+            "-dPreserveAnnots=false",
+        ]
+        if RESUBSET_FONTS:
+            cmd += [
+                "-dEmbedAllFonts=true",
+                "-dSubsetFonts=true",
+                "-dCompressFonts=true",
+                "-dCompatibilityLevel=1.7",
+            ]
+        if filtertext:
+            cmd += ["-dFILTERTEXT", f"-r{FILTERTEXT_DPI}"]
+        cmd += [
+            "-dDownsampleGrayImages=true",
+            "-dGrayImageResolution=300",
+            "-dGrayImageDownsampleType=/Bicubic",
+            f"-dGrayImageDownsampleThreshold={DOWNSAMPLE_THRESHOLD}",
+
+            "-dDownsampleMonoImages=true",
+            "-dMonoImageResolution=300",
+            "-dMonoImageDownsampleType=/Bicubic",
+            f"-dMonoImageDownsampleThreshold={DOWNSAMPLE_THRESHOLD}",
+
+            "-dDownsampleColorImages=true",
+            "-dColorImageResolution=300",
+            "-dColorImageDownsampleType=/Bicubic",
+            f"-dColorImageDownsampleThreshold={DOWNSAMPLE_THRESHOLD}",
+
+            "-sDEVICE=pdfwrite",
+            f"-sOutputFile={out_ps_path}",
+            tmp_def.name,
+            tmp_src.name,
+        ]
+
+        report_fh.write(f"[cmd] {subprocess.list2cmdline(cmd)}\n")
+
+        try:
+            res = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="cp866",
+                errors="replace",
+                cwd=str(work_dir),
+            )
+        except Exception as e:
+            return (False, f"subprocess exception: {e}")
+
+        output = res.stdout or ""
+        report_fh.write(output)
+        report_fh.write("\n")
+
+        if "Failed to open the supplied ICCProfile" in output:
+            return (False, output + "\n[ICC not readable]")
+        if "PDF/A processing aborted" in output:
+            return (False, output + "\n[PDF/A aborted]")
+        if res.returncode != 0:
+            return (False, output + f"\n[rc={res.returncode}]")
+        if not tmp_out.is_file() or tmp_out.stat().st_size == 0:
+            return (False, output + "\n[empty output]")
+
+        shutil.copyfile(tmp_out, dst)
+        return (True, output)
+
     except Exception as e:
-        return (False, f"exception: {e}")
+        return (False, f"workflow exception: {e}")
+    finally:
+        try:
+            shutil.rmtree(work_dir, ignore_errors=True)
+        except Exception:
+            pass
 
-    if res.returncode != 0:
-        return (False, res.stdout or f"rc={res.returncode}")
-    if not dst.is_file() or dst.stat().st_size == 0:
-        return (False, "output file missing or empty")
-    if "PDF/A processing aborted" in res.stdout:
-        return (False, "PDF/A processing aborted by GS")
 
-    return (True, res.stdout or "")
+# ============================================================
+#  Обесцвечивание content streams
+# ============================================================
+COLOR_OPS = {"rg", "RG", "k", "K"}
+
+
+def _luma(r: float, g: float, b: float) -> float:
+    """ITU-R BT.601."""
+    return 0.299 * r + 0.587 * g + 0.114 * b
+
+
+def _scan_color_operators(pdf_path: Path) -> tuple[int, int]:
+    if not HAVE_PIKEPDF:
+        return (0, 0)
+    total = 0
+    color = 0
+    try:
+        with pikepdf.open(pdf_path) as doc:
+            for page in doc.pages:
+                try:
+                    cs = list(pikepdf.parse_content_stream(page))
+                except Exception:
+                    continue
+                for _ops, op in cs:
+                    total += 1
+                    if str(op) in COLOR_OPS:
+                        color += 1
+    except Exception:
+        pass
+    return (total, color)
+
+
+def grayscale_content_streams(pdf_path: Path) -> tuple[int, int]:
+    if not HAVE_PIKEPDF:
+        return (0, 0)
+
+    total = 0
+    changed_total = 0
+    try:
+        with pikepdf.open(pdf_path, allow_overwriting_input=True) as doc:
+            for page in doc.pages:
+                try:
+                    cs = pikepdf.parse_content_stream(page)
+                except Exception:
+                    continue
+
+                new_cs = []
+                changed = 0
+                for operands, operator in cs:
+                    total += 1
+                    op = str(operator)
+                    if op in ("rg", "RG") and len(operands) == 3:
+                        try:
+                            r = float(operands[0])
+                            g = float(operands[1])
+                            b = float(operands[2])
+                            y = _luma(r, g, b)
+                            new_op = "g" if op == "rg" else "G"
+                            new_cs.append(([y], new_op))
+                            changed += 1
+                            continue
+                        except Exception:
+                            pass
+                    elif op in ("k", "K") and len(operands) == 4:
+                        try:
+                            c = float(operands[0])
+                            m = float(operands[1])
+                            yy = float(operands[2])
+                            k = float(operands[3])
+                            r = (1 - c) * (1 - k)
+                            g = (1 - m) * (1 - k)
+                            b = (1 - yy) * (1 - k)
+                            y = _luma(r, g, b)
+                            new_op = "g" if op == "k" else "G"
+                            new_cs.append(([y], new_op))
+                            changed += 1
+                            continue
+                        except Exception:
+                            pass
+                    new_cs.append((operands, operator))
+
+                if changed:
+                    try:
+                        new_bytes = pikepdf.unparse_content_stream(new_cs)
+                        page.Contents = doc.make_stream(new_bytes)
+                        changed_total += changed
+                    except Exception:
+                        pass
+
+            if changed_total:
+                doc.save(pdf_path, linearize=False)
+    except Exception:
+        return (total, 0)
+    return (total, changed_total)
 
 
 # ============================================================
 #  FIX TrueType post/maxp
 # ============================================================
 def fix_truetype_post_table(data: bytes) -> tuple[bytes, str]:
-    """
-    Правит numberOfGlyphs в таблице 'post' TrueType, чтобы он совпадал
-    с numGlyphs из таблицы 'maxp'. Возвращает (bytes, статус).
-    Если править нечего или нельзя -- возвращает исходные байты.
-    """
     if len(data) < 12:
         return (data, "too small")
-
     try:
         sfnt_version = int.from_bytes(data[0:4], "big")
-        # 0x00010000 = TrueType, 0x74727565 = 'true', 0x4F54544F = 'OTTO'
         if sfnt_version not in (0x00010000, 0x74727565):
             return (data, f"sfnt {sfnt_version:#x} not tt")
         num_tables = int.from_bytes(data[4:6], "big")
@@ -268,19 +449,14 @@ def fix_truetype_post_table(data: bytes) -> tuple[bytes, str]:
         elif tag == b"post":
             post_offset = offset
 
-    if maxp_offset is None:
-        return (data, "no maxp")
-    if post_offset is None:
-        return (data, "no post")
-    if maxp_offset + 6 > len(data):
-        return (data, "maxp out of range")
-    if post_offset + 34 > len(data):
-        return (data, "post out of range")
+    if maxp_offset is None or post_offset is None:
+        return (data, "no maxp/post")
+    if maxp_offset + 6 > len(data) or post_offset + 34 > len(data):
+        return (data, "out of range")
 
     num_glyphs = int.from_bytes(data[maxp_offset + 4:maxp_offset + 6], "big")
     post_version = int.from_bytes(data[post_offset:post_offset + 4], "big")
 
-    # numberOfGlyphs присутствует только в post v2.0
     if post_version != 0x00020000:
         return (data, f"post v{post_version:#x}, skip")
 
@@ -294,27 +470,18 @@ def fix_truetype_post_table(data: bytes) -> tuple[bytes, str]:
 
 
 def fix_fonts_in_pdf(pdf) -> tuple[int, int, int]:
-    """
-    Возвращает (total_fonts, cidset_removed, post_fixed).
-    """
     total = cidset_removed = post_fixed = 0
-
-    # Проходим по всем объектам, ищем FontDescriptor
     for obj in pdf.objects:
         if not isinstance(obj, pikepdf.Dictionary):
             continue
         if str(obj.get("/Type", "")) != "/FontDescriptor":
             continue
-
-        # --- CIDSet ---
         if STRIP_CIDSET and "/CIDSet" in obj:
             try:
                 del obj["/CIDSet"]
                 cidset_removed += 1
             except Exception:
                 pass
-
-        # --- FontFile2 (TrueType) ---
         if FIX_TRUETYPE_POST and "/FontFile2" in obj:
             total += 1
             try:
@@ -322,21 +489,18 @@ def fix_fonts_in_pdf(pdf) -> tuple[int, int, int]:
                 raw = bytes(ff.read_bytes())
                 new_raw, status = fix_truetype_post_table(raw)
                 if new_raw is not raw and len(new_raw) == len(raw):
-                    # записываем обратно
                     ff.write(new_raw)
-                    # синхронизируем Length1, если он есть
                     if "/Length1" in ff:
                         ff["/Length1"] = len(new_raw)
                     if status.startswith("fixed"):
                         post_fixed += 1
             except Exception:
                 pass
-
     return (total, cidset_removed, post_fixed)
 
 
 # ============================================================
-#  Постобработка pikepdf
+#  pikepdf-постобработка
 # ============================================================
 def pikepdf_postprocess(pdf_path: Path) -> tuple[bool, str]:
     if not HAVE_PIKEPDF:
@@ -345,13 +509,11 @@ def pikepdf_postprocess(pdf_path: Path) -> tuple[bool, str]:
     tmp_path = pdf_path.with_suffix(".tmp.pdf")
     try:
         with pikepdf.open(pdf_path) as pdf:
-            # --- 1. Шрифты: strip CIDSet + fix post/maxp ---
             try:
                 total_fonts, cid_removed, post_fixed = fix_fonts_in_pdf(pdf)
             except Exception:
                 total_fonts = cid_removed = post_fixed = 0
 
-            # --- 2. XMP PDF/A-2b identification ---
             try:
                 with pdf.open_metadata(set_pikepdf_as_editor=False) as meta:
                     meta.load(XMP_PDFA_ID)
@@ -365,7 +527,6 @@ def pikepdf_postprocess(pdf_path: Path) -> tuple[bool, str]:
                 except Exception:
                     pass
 
-            # --- 3. Пересохраняем ---
             pdf.save(
                 tmp_path,
                 linearize=False,
@@ -389,19 +550,43 @@ def pikepdf_postprocess(pdf_path: Path) -> tuple[bool, str]:
 
 
 # ============================================================
-#  Полный цикл для одного файла
+#  Полный цикл
 # ============================================================
-def convert(src: Path, dst: Path, report_fh) -> bool:
+def convert(src: Path, dst: Path, report_fh, ascii_tmp: Path) -> bool:
     filtertext = needs_filtertext(src.name)
-    tag = " [FILTERTEXT]" if filtertext else ""
+    keep_c     = keep_color(src.name)
+    tag = ""
+    if filtertext:
+        tag += " [FILTERTEXT]"
+    if keep_c:
+        tag += " [KEEP-COLOR]"
     print(f"    -> {dst.name}{tag}")
 
-    ok, msg = gs_convert(src, dst, filtertext)
+    ok, msg = gs_convert(src, dst, ascii_tmp, report_fh)
     if not ok:
         report_fh.write(f"PDF/A ERROR: GS conversion failed for {src.name}\n")
-        if msg:
-            report_fh.write(msg + "\n")
         return False
+
+    if keep_c:
+        report_fh.write(
+            f"[decolor-content] {src.name}: пропущен (KEEP_COLOR_PREFIXES)\n"
+        )
+    else:
+        try:
+            total, color = _scan_color_operators(dst)
+            if color > 0:
+                total2, changed = grayscale_content_streams(dst)
+                report_fh.write(
+                    f"[decolor-content] {src.name}: "
+                    f"ops={total}, color={color}, заменено={changed}\n"
+                )
+            else:
+                report_fh.write(
+                    f"[decolor-content] {src.name}: "
+                    f"ops={total}, цветных операторов нет\n"
+                )
+        except Exception as e:
+            report_fh.write(f"[decolor-content] {src.name}: ошибка {e}\n")
 
     ok, msg = pikepdf_postprocess(dst)
     report_fh.write(f"[postprocess] {src.name}: {msg}\n")
@@ -412,7 +597,7 @@ def convert(src: Path, dst: Path, report_fh) -> bool:
 
 
 # ============================================================
-#  pdfimages -list для отчёта
+#  pdfimages
 # ============================================================
 def list_images(pdf: Path, report_fh) -> None:
     if not PDFIMAGES.exists():
@@ -440,7 +625,7 @@ def list_images(pdf: Path, report_fh) -> None:
 #  Main
 # ============================================================
 def main() -> int:
-    preflight()
+    ascii_tmp = preflight()
 
     if REPORT.exists():
         REPORT.unlink()
@@ -457,9 +642,10 @@ def main() -> int:
     with REPORT.open("w", encoding="utf-8") as report_fh:
         for i, src in enumerate(sources, start=1):
             print(f"[{i}] Processing: {src.name}")
+            report_fh.write(f"\n====\n[{i}] Processing: {src.name}\n====\n")
             dst = src.with_name(f"{src.stem}_pdfa.pdf")
 
-            if convert(src, dst, report_fh):
+            if convert(src, dst, report_fh, ascii_tmp):
                 done += 1
                 report_fh.write(f"\n====\nFile: {dst.name}\n====\n")
                 list_images(dst, report_fh)
